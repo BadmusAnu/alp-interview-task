@@ -1,0 +1,198 @@
+# =========================================
+# Global image settings (local registry/proxy)
+# =========================================
+# global:
+#   imageRegistry: "registry.kube-system.svc.cluster.local:5000"
+  # imagePullSecrets:
+  #   - name: registry-creds
+
+# =========================================
+# Enable core components
+# =========================================
+kubeStateMetrics:
+  enabled: true
+
+nodeExporter:
+  enabled: true
+
+kubelet:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    cAdvisor: true
+
+kubeApiServer:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+kubeControllerManager:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+kubeScheduler:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+kubeProxy:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+coreDns:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+kubeEtcd:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+
+# =========================================
+# Prometheus & default rules
+# =========================================
+prometheus:
+  enabled: true
+  service:
+    type: ClusterIP
+  prometheusSpec:
+    retention: 15d
+    scrapeInterval: 30s
+
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+
+    # ---- Inline extra scrape job for external URL uptime ----
+    additionalScrapeConfigs:
+      - job_name: 'uptime-public-frontend'
+        scheme: https
+        metrics_path: /
+        static_configs:
+          - targets:
+              - 'localhost:8080' # conside balckbox instead
+        scrape_timeout: 5s
+    # ----------------------------------------------------------
+
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    configReloaders: true
+    general: true
+    k8s: true
+    kubeApiserver: true
+    kubeApiserverAvailability: true
+    kubeApiserverSlos: true
+    kubeControllerManager: true
+    kubelet: true
+    kubeProxy: true
+    kubeScheduler: true
+    kubeStateMetrics: true
+    kubeletResource: true
+    kubeletPod: true
+    node: true
+    nodeExporter: true
+    prometheus: true
+    prometheusOperator: true
+    time: true
+    etcd: false
+
+# =========================================
+# Grafana (admin creds via existing Secret)
+# =========================================
+grafana:
+  enabled: true
+  service:
+    type: ClusterIP
+    port: 80
+  admin:
+    existingSecret: grafana-admin-credentials
+    userKey: admin-user
+    passwordKey: admin-password
+  persistence:
+    enabled: false
+
+# =========================================
+# Alertmanager (tokens/templates via Secret)
+# =========================================
+alertmanager:
+  enabled: true
+  service:
+    type: ClusterIP
+  alertmanagerSpec:
+    secrets:
+      - alertmanager-secrets
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: "null"
+      group_by: ["alertname", "namespace"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 3h
+      routes:
+        - receiver: "slack"
+          matchers:
+            - severity =~ "warning|critical"
+    receivers:
+      - name: "slack"
+        slack_configs:
+          - api_url: /etc/alertmanager/secrets/slack_webhook_url
+            channel: "#alerts"
+            send_resolved: true
+      - name: "null"
+
+# =========================================
+# Prometheus Operator
+# =========================================
+prometheusOperator:
+  enabled: true
+
+# =========================================
+# Additional ServiceMonitors for in-cluster Services
+# =========================================
+additionalServiceMonitors:
+  - name: "frontend-servicemonitor"
+    namespace: monitoring
+    selector:
+      matchLabels:
+        app: frontend
+    namespaceSelector:
+      matchNames: ["app"]
+    endpoints:
+      - port: metrics
+        interval: 30s
+        path: /metrics
+        scheme: http
+# =========================================
+# Alert rules for uptime (internal + public)
+# =========================================
+additionalPrometheusRulesMap:
+  uptime-rules:
+    groups:
+      - name: uptime.rules
+        rules:
+          # external frontend service down
+          - alert: FrontendTargetDown
+            expr: up{job=~".*frontend-servicemonitor.*"} == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Frontend (internal) scrape down ({{ $labels.instance }})"
+              description: "Prometheus failed to scrape the 'frontend' target for 2 minutes."
+
+          # external endpoint down (inline uptime job)
+          - alert: PublicFrontendDown
+            expr: up{job="uptime-public-frontend"} == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Public endpoint down ({{ $labels.instance }})"
+              description: "Prometheus (from within the cluster) failed to fetch the public URL."
