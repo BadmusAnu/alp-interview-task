@@ -26,7 +26,8 @@ spec:
           - until (mongo --host python-guestbook-mongodb:27017 >/dev/null) do echo "Waiting for connection for 2 sec."; sleep 2; done
       containers:
       - name: backend
-        image: python-guestbook-backend
+        image: python-guestbook-backend:latest
+        imagePullPolicy: Always
         ports:
         - name: http-server
           containerPort: 8080

@@ -1,5 +1,5 @@
 # Makefile (bash)
-SHELL := /usr/bin/env bash
+SHELL := /usr/bin/bash
 .ONESHELL:
 .SHELLFLAGS := -eu -o pipefail -c
 
@@ -7,15 +7,24 @@ SHELL := /usr/bin/env bash
 # User-configurable variables
 # ------------------------------------------------------------
 RELEASE_NAME  ?= kube-prometheus-stack
-VALUES_FILE   ?= ./deployment/kube-prometheus-stack-helm/monitoring-values.yaml
-MANIFESTS_DIR ?= ./app-kubernetes-manifests
+VALUES_FILE   ?= ./deployment/kube-promethues-stack-helm/values.yaml
+MANIFESTS_DIR ?= ./deployment/app-kubernetes-manifests
 
-# Internal file for local registry info
-ENV_FILE := .local.env
+# kind cluster name (only used when --kind is passed)
+KIND_CLUSTER ?= kind
 
-# Detect non-interactive flag
+# Detect flags
 ifneq (,$(findstring --no-prompt,$(MAKECMDGOALS)))
   NO_PROMPT := 1
+endif
+ifneq (,$(findstring --kind,$(MAKECMDGOALS)))
+  USE_KIND := 1
+endif
+
+# Pick build step based on flag (default = minikube build)
+BUILD_STEP := build
+ifeq ($(USE_KIND),1)
+  BUILD_STEP := kind-build
 endif
 
 # ------------------------------------------------------------
@@ -43,53 +52,30 @@ init:
 	kubectl get ns app >/dev/null 2>&1 || kubectl create ns app
 	kubectl get ns monitoring >/dev/null 2>&1 || kubectl create ns monitoring
 
-	@echo "Enabling Minikube registry..."
-	if command -v minikube >/dev/null 2>&1; then
-	  echo "Enabling Minikube registry..."
-	  minikube addons enable registry >/dev/null 2>&1 || true
-
-	  echo "Configuring registry as a pull-through cache for quay.io..."
-	  kubectl -n kube-system set env deploy/registry REGISTRY_PROXY_REMOTEURL=https://quay.io >/dev/null
-
-	  echo "Restarting registry to apply settings..."
-	  kubectl -n kube-system rollout restart deploy/registry >/dev/null
-	  kubectl -n kube-system rollout status deploy/registry --timeout=120s || true
-	  sleep 2
-
-	  REG_URL=$$(minikube -n kube-system service registry --url 2>/dev/null | head -n1 || true)
-	  CLUSTER_SVC="registry.kube-system.svc.cluster.local:5000"
-
-	  if [ -n "$$REG_URL" ]; then
-	    { echo "REGISTRY_URL=$$REG_URL"; echo "REGISTRY_CLUSTER=$$CLUSTER_SVC"; } > $(ENV_FILE)
-	    echo "Local registry (host): $$REG_URL"
-	    echo "Local registry (cluster DNS): $$CLUSTER_SVC"
-	    echo "Proxying upstream: quay.io"
-	  else
-	    echo "Could not detect registry URL; run 'minikube addons list' to confirm it's running."
-	  fi
-	else
-	  echo "Minikube not detected; skipping registry setup."
-	fi
-
-
 	@echo "init complete."
 
 # ------------------------------------------------------------
-# make build
+# make build  (default path: Minikube)
 # ------------------------------------------------------------
 .PHONY: build
 build:
-	@source $(ENV_FILE) 2>/dev/null || true; \
-	REG_URL="$${REGISTRY_URL:-}"; \
-	if [ -z "$$REG_URL" ]; then \
-	  echo "Missing REGISTRY_URL. Run 'make init' first."; exit 1; fi; \
-	TARGET="$${REG_URL#http://}/myapp:local"; \
-	echo "Building Docker image: $$TARGET"; \
-	docker build -t $$TARGET .; \
-	echo "Pushing image to local registry..."; \
-	if ! docker push $$TARGET; then \
-	  echo "Push failed. Re-run 'make init' to ensure registry is running."; exit 1; fi; \
-	echo "build complete."
+	# Build images locally into Minikube (no registry)
+	BACKEND_NAME="python-guestbook-backend"; BACKEND_CONTEXT="./app/backend"; \
+	FRONTEND_NAME="python-guestbook-frontend"; FRONTEND_CONTEXT="./app/frontend"; \
+	echo "Building $$BACKEND_NAME -> $$BACKEND_NAME:latest"; \
+	minikube image build -t "$$BACKEND_NAME:latest" "$$BACKEND_CONTEXT"; \
+	echo "Building $$FRONTEND_NAME -> $$FRONTEND_NAME:latest"; \
+	minikube image build -t "$$FRONTEND_NAME:latest" "$$FRONTEND_CONTEXT"; \
+	echo "build complete for backend and frontend"
+
+# kind build/load path (invoked when --kind is passed)
+.PHONY: kind-build
+kind-build:
+	@echo "Building and loading images into kind..."
+	docker build -t python-guestbook-backend:latest ./app/backend
+	docker build -t python-guestbook-frontend:latest ./app/frontend
+	kind load docker-image python-guestbook-backend:latest --name $(KIND_CLUSTER)
+	kind load docker-image python-guestbook-frontend:latest --name $(KIND_CLUSTER)
 
 # ------------------------------------------------------------
 # make validate
@@ -118,10 +104,19 @@ validate:
 apply:
 	@echo "Applying app manifests..."
 	if [ -d "$(MANIFESTS_DIR)" ]; then
-	  kubectl apply -f $(MANIFESTS_DIR)
+	  kubectl apply -f $(MANIFESTS_DIR) -n app
 	else
 	  echo "No $(MANIFESTS_DIR) directory found; skipping app deployment."
 	fi
+
+	@echo "Ensuring monitoring secrets (Grafana admin creds)..."
+	GRAF_USER="admin"; \
+	GRAF_PASS="$$( (command -v openssl >/dev/null 2>&1 && openssl rand -base64 24) || head -c 32 /dev/urandom | base64 )"; \
+	GRAF_PASS="$${GRAF_PASS//[^a-zA-Z0-9]/}"; GRAF_PASS="$${GRAF_PASS:0:24}"; \
+	kubectl -n monitoring create secret generic grafana-admin-credentials \
+	  --from-literal=admin-user="$$GRAF_USER" \
+	  --from-literal=admin-password="$$GRAF_PASS" \
+	  --dry-run=client -o yaml | kubectl apply -f -
 
 	@echo "Installing/Upgrading kube-prometheus-stack..."
 	helm upgrade --install $(RELEASE_NAME) prometheus-community/kube-prometheus-stack \
@@ -129,8 +124,13 @@ apply:
 	  -f $(VALUES_FILE)
 
 	@echo "Starting port-forwards..."
-	nohup kubectl -n app port-forward svc/frontend 8080:80 >/dev/null 2>&1 &
-	nohup kubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80 >/dev/null 2>&1 &
+	# Stop any existing forwards for the same services
+	pkill -f "[k]ubectl -n app port-forward svc/python-guestbook-frontend 8080:80" || true
+	pkill -f "[k]ubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80" || true
+
+	# Run forwards in a simple restart loop to survive restarts
+	nohup bash -c 'while true; do kubectl -n app port-forward svc/python-guestbook-frontend 8080:80 --address 127.0.0.1; sleep 1; done' >/dev/null 2>&1 &
+	nohup bash -c 'while true; do kubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80 --address 127.0.0.1; sleep 1; done' >/dev/null 2>&1 &
 	sleep 2
 
 	@echo "apply complete."
@@ -138,10 +138,11 @@ apply:
 	@echo "Grafana : http://localhost:3000"
 
 # ------------------------------------------------------------
-# make all (validate + prompt + apply)
+# make all (validate + build (minikube by default / kind with --kind) + prompt + apply)
 # ------------------------------------------------------------
 .PHONY: all
 all: validate
+	@$(MAKE) $(BUILD_STEP)
 	@if [[ "$${NO_PROMPT:-}" == "1" ]]; then \
 	  $(MAKE) apply; \
 	else \
@@ -153,6 +154,11 @@ all: validate
 	  fi; \
 	fi
 
+# Flag targets (no-ops, used for detection)
 .PHONY: --no-prompt
 --no-prompt:
+	@true
+
+.PHONY: --kind
+--kind:
 	@true
