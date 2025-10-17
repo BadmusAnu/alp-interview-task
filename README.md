@@ -76,6 +76,22 @@ Stop port-forwards:
 - `make stop-forward`
 
 
+## Kind Local Cluster (start-local.sh)
+
+You can create and iterate on a local kind cluster with a colocated registry and NGINX Ingress using the provided script:
+
+- Start kind + local registry + Ingress:
+  - `./start-local.sh`
+- Then deploy using kind workflow:
+  - `make all KIND=true` (or non-interactive: `make all PROMPT=false KIND=true`)
+
+Notes
+
+- The script exposes Ingress on host ports 80/443 and configures a local registry on `localhost:5000` for containerd.
+- The Makefile’s `kind-build` target builds with Docker and uses `kind load` to load images into the cluster (no registry push needed).
+- If you prefer pushing to the local registry, you can tag images as `localhost:5000/<image>:tag` and update your manifests or Helm values to pull from it.
+
+
 ## Grafana Access
 
 The Makefile creates a Secret `grafana-admin-credentials` if it does not exist.
