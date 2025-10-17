@@ -10,20 +10,17 @@ RELEASE_NAME  ?= kube-prometheus-stack
 VALUES_FILE   ?= ./deployment/kube-promethues-stack-helm/values.yaml
 MANIFESTS_DIR ?= ./deployment/app-kubernetes-manifests
 
+
+# Control variables (override at invocation: PROMPT=false KIND=true)
+PROMPT ?= true
+KIND ?= false
+
 # kind cluster name (only used when --kind is passed)
 KIND_CLUSTER ?= kind
 
-# Detect flags
-ifneq (,$(findstring --no-prompt,$(MAKECMDGOALS)))
-  NO_PROMPT := 1
-endif
-ifneq (,$(findstring --kind,$(MAKECMDGOALS)))
-  USE_KIND := 1
-endif
-
 # Pick build step based on flag (default = minikube build)
 BUILD_STEP := build
-ifeq ($(USE_KIND),1)
+ifeq ($(KIND),true)
   BUILD_STEP := kind-build
 endif
 
@@ -34,7 +31,7 @@ endif
 init:
 	@echo "Checking Kubernetes cluster..."
 	if ! kubectl cluster-info >/dev/null 2>&1; then
-	  echo "No cluster detected. Please start Minikube: 'minikube start'"; exit 1; fi
+	  echo "No cluster detected. Please start Minikube: 'minikube start' or start kind cluster"; exit 1; fi
 
 	@echo "Checking Helm installation..."
 	if ! command -v helm >/dev/null 2>&1; then
@@ -110,40 +107,115 @@ apply:
 	fi
 
 	@echo "Ensuring monitoring secrets (Grafana admin creds)..."
-	GRAF_USER="admin"; \
-	GRAF_PASS="$$( (command -v openssl >/dev/null 2>&1 && openssl rand -base64 24) || head -c 32 /dev/urandom | base64 )"; \
-	GRAF_PASS="$${GRAF_PASS//[^a-zA-Z0-9]/}"; GRAF_PASS="$${GRAF_PASS:0:24}"; \
-	kubectl -n monitoring create secret generic grafana-admin-credentials \
-	  --from-literal=admin-user="$$GRAF_USER" \
-	  --from-literal=admin-password="$$GRAF_PASS" \
-	  --dry-run=client -o yaml | kubectl apply -f -
+	if kubectl -n monitoring get secret grafana-admin-credentials >/dev/null 2>&1; then \
+	  echo "grafana-admin-credentials exists; leaving unchanged."; \
+	else \
+	  GRAF_USER="$${GRAFANA_ADMIN_USER:-admin}"; \
+	  GRAF_PASS="$${GRAFANA_ADMIN_PASSWORD:-}"; \
+	  if [[ -z "$${GRAF_PASS:-}" ]]; then \
+	    if command -v openssl >/dev/null 2>&1; then \
+	      GRAF_PASS="$$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)"; \
+	    else \
+	      GRAF_PASS="$$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)"; \
+	    fi; \
+	  fi; \
+	  kubectl -n monitoring create secret generic grafana-admin-credentials \
+	    --from-literal=admin-user="$$GRAF_USER" \
+	    --from-literal=admin-password="$$GRAF_PASS"; \
+	  echo "Created grafana-admin-credentials secret."; \
+	fi
 
 	@echo "Installing/Upgrading kube-prometheus-stack..."
 	helm upgrade --install $(RELEASE_NAME) prometheus-community/kube-prometheus-stack \
 	  --namespace monitoring \
 	  -f $(VALUES_FILE)
 
-	@echo "Starting port-forwards..."
-	# Stop any existing forwards for the same services
-	pkill -f "[k]ubectl -n app port-forward svc/python-guestbook-frontend 8080:80" || true
-	pkill -f "[k]ubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80" || true
+	@echo "Installing/Upgrading prometheus-blackbox-exporter..."
+	helm upgrade --install prometheus-blackbox-exporter prometheus-community/prometheus-blackbox-exporter \
+	  --namespace monitoring \
+	  --wait
 
-	# Run forwards in a simple restart loop to survive restarts
-	nohup bash -c 'while true; do kubectl -n app port-forward svc/python-guestbook-frontend 8080:80 --address 127.0.0.1; sleep 1; done' >/dev/null 2>&1 &
-	nohup bash -c 'while true; do kubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80 --address 127.0.0.1; sleep 1; done' >/dev/null 2>&1 &
-	sleep 2
+	@echo "Starting background port-forwards (silent, daemonized)..."
+	# Clean previous
+	-@start-stop-daemon --stop --pidfile /tmp/pf-frontend.pid >/dev/null 2>&1 || true
+	-@start-stop-daemon --stop --pidfile /tmp/pf-grafana.pid  >/dev/null 2>&1 || true
+	@rm -f /tmp/pf-frontend.pid /tmp/pf-grafana.pid
+
+	# Prefer start-stop-daemon if available
+	@if command -v start-stop-daemon >/dev/null 2>&1; then \
+	  start-stop-daemon --start --background --make-pidfile \
+	    --pidfile /tmp/pf-frontend.pid \
+	    --exec /usr/bin/bash -- -c 'while true; do \
+	      kubectl -n app port-forward svc/python-guestbook-frontend 8080:80 --address 127.0.0.1 >/dev/null 2>&1; \
+	      sleep 2; \
+	    done' >/dev/null 2>&1; \
+	  start-stop-daemon --start --background --make-pidfile \
+	    --pidfile /tmp/pf-grafana.pid \
+	    --exec /usr/bin/bash -- -c 'while true; do \
+	      kubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80 --address 127.0.0.1 >/dev/null 2>&1; \
+	      sleep 2; \
+	    done' >/dev/null 2>&1; \
+	else \
+	  ( nohup setsid bash -c 'while true; do \
+	      kubectl -n app port-forward svc/python-guestbook-frontend 8080:80 --address 127.0.0.1 >/dev/null 2>&1 < /dev/null || true; \
+	      sleep 2; \
+	    done' >/dev/null 2>&1 < /dev/null & echo $$! > /tmp/pf-frontend.pid ) >/dev/null 2>&1; \
+	  ( nohup setsid bash -c 'while true; do \
+	      kubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80 --address 127.0.0.1 >/dev/null 2>&1 < /dev/null || true; \
+	      sleep 2; \
+	    done' >/dev/null 2>&1 < /dev/null & echo $$! > /tmp/pf-grafana.pid ) >/dev/null 2>&1; \
+	fi
 
 	@echo "apply complete."
-	@echo "Frontend: http://localhost:8080"
-	@echo "Grafana : http://localhost:3000"
+	@echo "Frontend:  http://localhost:8080"
+	@echo "Grafana :  http://localhost:3000"
 
 # ------------------------------------------------------------
-# make all (validate + build (minikube by default / kind with --kind) + prompt + apply)
+# admin helpers
+# ------------------------------------------------------------
+.PHONY: grafana-show-admin
+grafana-show-admin:
+	@echo "Grafana admin user:"; \
+	kubectl -n monitoring get secret grafana-admin-credentials -o jsonpath='{.data.admin-user}' | base64 --decode; echo
+	@echo "Grafana admin password:"; \
+	kubectl -n monitoring get secret grafana-admin-credentials -o jsonpath='{.data.admin-password}' | base64 --decode; echo
+
+.PHONY: grafana-rotate-admin
+grafana-rotate-admin:
+	@echo "Updating grafana-admin-credentials secret..."
+	GRAF_USER="$${GRAFANA_ADMIN_USER:-admin}"; \
+	GRAF_PASS="$${GRAFANA_ADMIN_PASSWORD:-}"; \
+	if [[ -z "$${GRAF_PASS:-}" ]]; then \
+	  if command -v openssl >/dev/null 2>&1; then \
+	    GRAF_PASS="$$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)"; \
+	  else \
+	    GRAF_PASS="$$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)"; \
+	  fi; \
+	fi; \
+	kubectl -n monitoring create secret generic grafana-admin-credentials \
+	  --from-literal=admin-user="$$GRAF_USER" \
+	  --from-literal=admin-password="$$GRAF_PASS" \
+	  --dry-run=client -o yaml | kubectl apply -f -; \
+	echo "Restarting Grafana deployment..."; \
+	kubectl -n monitoring rollout restart deploy/$(RELEASE_NAME)-grafana; \
+	kubectl -n monitoring rollout status deploy/$(RELEASE_NAME)-grafana
+
+.PHONY: stop-forward
+stop-forward:
+	-@start-stop-daemon --stop --pidfile /tmp/pf-frontend.pid >/dev/null 2>&1 || true
+	-@start-stop-daemon --stop --pidfile /tmp/pf-grafana.pid  >/dev/null 2>&1 || true
+	-@xargs -r kill < /tmp/pf-frontend.pid >/dev/null 2>&1 || true
+	-@xargs -r kill < /tmp/pf-grafana.pid  >/dev/null 2>&1 || true
+	@rm -f /tmp/pf-frontend.pid /tmp/pf-grafana.pid >/dev/null 2>&1 || true
+
+
+# ------------------------------------------------------------
+# make all (init + validate + build (minikube by default / kind with --kind) + prompt + apply)
 # ------------------------------------------------------------
 .PHONY: all
-all: validate
+all: init validate
 	@$(MAKE) $(BUILD_STEP)
-	@if [[ "$${NO_PROMPT:-}" == "1" ]]; then \
+	@if [ "$(PROMPT)" = "false" ]; then \
 	  $(MAKE) apply; \
 	else \
 	  read -p "Proceed to apply? [y/N]: " ans; \
@@ -154,11 +226,4 @@ all: validate
 	  fi; \
 	fi
 
-# Flag targets (no-ops, used for detection)
-.PHONY: --no-prompt
---no-prompt:
-	@true
-
-.PHONY: --kind
---kind:
-	@true
+# (No flag targets; use PROMPT=false and/or KIND=true instead)

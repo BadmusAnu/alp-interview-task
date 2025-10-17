@@ -66,16 +66,26 @@ prometheus:
     podMonitorSelectorNilUsesHelmValues: false
     probeSelectorNilUsesHelmValues: false
 
-    # ---- Inline extra scrape job for external URL uptime ----
+    # ---- Blackbox HTTP probe for frontend uptime (requires prometheus-blackbox-exporter) ----
     additionalScrapeConfigs:
-      - job_name: 'uptime-public-frontend'
-        scheme: https
-        metrics_path: /
+      - job_name: 'blackbox-http'
+        metrics_path: /probe
+        params:
+          module: [http_2xx]
         static_configs:
           - targets:
-              - 'localhost:8080' # conside balckbox instead
+              # In-cluster service endpoint to check HTTP uptime
+              - 'http://python-guestbook-frontend.app.svc.cluster.local'
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: __param_target
+          - source_labels: [__param_target]
+            target_label: instance
+          - target_label: __address__
+            replacement: 'prometheus-blackbox-exporter.monitoring.svc.cluster.local:9115'
+        scrape_interval: 30s
         scrape_timeout: 5s
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
 
 defaultRules:
   create: true
@@ -124,8 +134,7 @@ alertmanager:
   service:
     type: ClusterIP
   alertmanagerSpec:
-    secrets:
-      - alertmanager-secrets
+    portName: "http-web"
   config:
     global:
       resolve_timeout: 5m
@@ -142,8 +151,7 @@ alertmanager:
     receivers:
       - name: "slack"
         slack_configs:
-          - api_url: /etc/alertmanager/secrets/slack_webhook_url
-            channel: "#alerts"
+          - api_url: https://hooks.slack.com/services/REPLACE/ME/WITH_REAL_WEBHOOK
             send_resolved: true
       - name: "null"
 
@@ -154,21 +162,10 @@ prometheusOperator:
   enabled: true
 
 # =========================================
-# Additional ServiceMonitors for in-cluster Services
+# Additional ServiceMonitors
+# (none; app does not expose /metrics)
 # =========================================
-additionalServiceMonitors:
-  - name: "frontend-servicemonitor"
-    namespace: monitoring
-    selector:
-      matchLabels:
-        app: frontend
-    namespaceSelector:
-      matchNames: ["app"]
-    endpoints:
-      - port: metrics
-        interval: 30s
-        path: /metrics
-        scheme: http
+# additionalServiceMonitors: []
 # =========================================
 # Alert rules for uptime (internal + public)
 # =========================================
@@ -177,22 +174,12 @@ additionalPrometheusRulesMap:
     groups:
       - name: uptime.rules
         rules:
-          # external frontend service down
-          - alert: FrontendTargetDown
-            expr: up{job=~".*frontend-servicemonitor.*"} == 0
-            for: 2m
+          # HTTP uptime via blackbox probe (frontend)
+          - alert: HttpFrontendDown30s
+            expr: probe_success{job="blackbox-http"} == 0
+            for: 30s
             labels:
               severity: critical
             annotations:
-              summary: "Frontend (internal) scrape down ({{ $labels.instance }})"
-              description: "Prometheus failed to scrape the 'frontend' target for 2 minutes."
-
-          # external endpoint down (inline uptime job)
-          - alert: PublicFrontendDown
-            expr: up{job="uptime-public-frontend"} == 0
-            for: 2m
-            labels:
-              severity: critical
-            annotations:
-              summary: "Public endpoint down ({{ $labels.instance }})"
-              description: "Prometheus (from within the cluster) failed to fetch the public URL."
+              summary: "Frontend HTTP down ({{ $labels.instance }})"
+              description: "Blackbox HTTP probe failed (no 2xx) for 30s."
