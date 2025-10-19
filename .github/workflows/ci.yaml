@@ -20,7 +20,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y make curl ca-certificates gnupg docker.io
+          sudo apt-get install -y make curl ca-certificates gnupg
 
           # kubectl
           KUBECTL_VERSION="$(curl -Ls https://dl.k8s.io/release/stable.txt)"
