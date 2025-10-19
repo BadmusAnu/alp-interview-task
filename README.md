@@ -41,16 +41,16 @@ receivers:
       - api_url: https://hooks.slack.com/services/REPLACE/ME/WITH_REAL_WEBHOOK
         send_resolved: true
 
-2) Initialize tooling and namespaces
+2) Initialize tooling, namespaces, and CRDs
 
-Run once to verify cluster access, ensure Helm, add repos, and create namespaces:
+Run once to verify cluster access, ensure Helm, add repos, create namespaces, and pre-install kube-prometheus-stack CRDs (server-side apply):
 
 - `make init`
 
 
 ## Build and Deploy
 
-You can use Minikube (default) or kind. The Makefile supports a streamlined flow:
+You can use Minikube (default) or kind. The Makefile supports both paths.
 
 - Minikube (default, prompts before apply): `make all`
 - Non-interactive: `make all PROMPT=false`
@@ -60,36 +60,37 @@ You can use Minikube (default) or kind. The Makefile supports a streamlined flow
 What `make all` does:
 
 - `init` → checks cluster/helm, adds repos, creates `app` and `monitoring` namespaces
+  - If `KIND=true` and no cluster is detected, runs `./start-local.sh` to create a kind cluster (with local registry + ingress) then waits for nodes Ready
 - `validate` → dry-run Helm and validate app manifests
-- Build app images and load into the cluster (Minikube or kind)
-- `apply` →
-  - Deploys the app manifests to `app` namespace
-  - Ensures Grafana admin Secret (idempotent)
-  - Installs/Upgrades kube-prometheus-stack (using your `values.yaml`)
-  - Installs/Upgrades Blackbox Exporter in `monitoring`
-  - Starts background port-forwards:
-    - Frontend → `http://localhost:8080`
-    - Grafana  → `http://localhost:3000`
+- Build app images
+  - Minikube: `minikube image build`
+  - kind: build and push to the local registry `localhost:5000`
+- Apply
+  - Minikube: `apply` uses Ingress (enable addon once: `minikube addons enable ingress`)
+  - kind: `kind-apply` uses Ingress and updates Deployments to pull from `localhost:5000`
 
-Stop port-forwards:
+Access after apply (Ingress)
 
-- `make stop-forward`
+- Frontend → `http://localhost/`
+- Grafana  → `http://grafana.localhost/`
 
 
-## Kind Local Cluster (start-local.sh)
+## Kind Workflow (local registry + ingress)
 
-You can create and iterate on a local kind cluster with a colocated registry and NGINX Ingress using the provided script:
+The provided script creates a kind cluster with a colocated registry and NGINX Ingress:
 
-- Start kind + local registry + Ingress:
-  - `./start-local.sh`
-- Then deploy using kind workflow:
-  - `make all KIND=true` (or non-interactive: `make all PROMPT=false KIND=true`)
+- Create cluster: `./start-local.sh`
+- Initialize (auto-runs start-local when KIND=true): `make init KIND=true` or `make kind-init`
+- Validate: `make validate`
+- Build images and push to registry: `make kind-build`
+- Apply using Ingress + registry images: `make kind-apply`
 
 Notes
 
-- The script exposes Ingress on host ports 80/443 and configures a local registry on `localhost:5000` for containerd.
-- The Makefile’s `kind-build` target builds with Docker and uses `kind load` to load images into the cluster (no registry push needed).
-- If you prefer pushing to the local registry, you can tag images as `localhost:5000/<image>:tag` and update your manifests or Helm values to pull from it.
+- `start-local.sh` exposes Ingress on host ports 80/443 and configures a local registry on `localhost:5000` in containerd.
+- `kind-build` tags images as `localhost:5000/python-guestbook-{backend,frontend}:latest` and pushes to the local registry; deployments are updated in `kind-apply`.
+- List clusters: `kind get clusters`
+- Switch context: `kubectl config use-context kind-<name>`
 
 
 ## Grafana Access
@@ -100,7 +101,12 @@ The Makefile creates a Secret `grafana-admin-credentials` if it does not exist.
 - Rotate credentials and restart Grafana:
   - Example: `GRAFANA_ADMIN_PASSWORD='StrongPass123!' make grafana-rotate-admin`
 
-Grafana URL: `http://localhost:3000`
+Grafana (via Ingress): `http://grafana.localhost/`
+
+If you prefer port-forward (alternative):
+
+- `kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80`
+- Then open `http://localhost:3000`
 
 
 ## Alerting and Uptime
@@ -147,6 +153,10 @@ If nothing shows up:
 - Blackbox exporter status
   - Installed by `make apply` as `prometheus-blackbox-exporter` in `monitoring`
   - Check: `kubectl -n monitoring get pods -l app.kubernetes.io/name=prometheus-blackbox-exporter`
+
+- CRD preinstall on dev (CI)
+  - If you preinstall kube-prometheus-stack CRDs manually, use server-side apply to avoid large annotation errors:
+    - `helm show crds prometheus-community/kube-prometheus-stack | kubectl apply --server-side -f -`
 
 
 ## Notes

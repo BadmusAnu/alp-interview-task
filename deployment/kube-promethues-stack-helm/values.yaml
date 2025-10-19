@@ -125,6 +125,13 @@ grafana:
     passwordKey: admin-password
   persistence:
     enabled: false
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+      - grafana.localhost
+    path: /
+    pathType: Prefix
 
 # =========================================
 # Alertmanager (tokens/templates via Secret)

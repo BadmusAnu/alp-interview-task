@@ -18,10 +18,19 @@ KIND ?= false
 # kind cluster name (only used when --kind is passed)
 KIND_CLUSTER ?= kind
 
+# Local registry used by start-local.sh for KIND workflow
+REGISTRY ?= localhost:5000
+
 # Pick build step based on flag (default = minikube build)
 BUILD_STEP := build
 ifeq ($(KIND),true)
   BUILD_STEP := kind-build
+endif
+
+# Pick apply step based on flag (default = apply for Minikube)
+APPLY_STEP := apply
+ifeq ($(KIND),true)
+  APPLY_STEP := kind-apply
 endif
 
 # ------------------------------------------------------------
@@ -31,7 +40,16 @@ endif
 init:
 	@echo "Checking Kubernetes cluster..."
 	if ! kubectl cluster-info >/dev/null 2>&1; then
-	  echo "No cluster detected. Please start Minikube: 'minikube start' or start kind cluster"; exit 1; fi
+	  if [ "$(KIND)" = "true" ]; then \
+	    echo "No cluster detected. Starting kind via ./start-local.sh..."; \
+	    chmod +x ./start-local.sh || true; \
+	    ./start-local.sh; \
+	    echo "Waiting for nodes to be Ready..."; \
+	    kubectl wait --for=condition=Ready nodes --all --timeout=180s; \
+	  else \
+	    echo "No cluster detected. Please start Minikube: 'minikube start' or start kind cluster"; exit 1; \
+	  fi; \
+	fi
 
 	@echo "Checking Helm installation..."
 	if ! command -v helm >/dev/null 2>&1; then
@@ -45,11 +63,19 @@ init:
 	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
 	helm repo update >/dev/null
 
+	@echo "Pre-installing kube-prometheus-stack CRDs (server-side apply)..."
+	helm show crds prometheus-community/kube-prometheus-stack | kubectl apply --server-side -f - >/dev/null || true
+
 	@echo "Creating namespaces..."
 	kubectl get ns app >/dev/null 2>&1 || kubectl create ns app
 	kubectl get ns monitoring >/dev/null 2>&1 || kubectl create ns monitoring
 
 	@echo "init complete."
+
+# Convenience target to init using kind
+.PHONY: kind-init
+kind-init:
+	@$(MAKE) init KIND=true
 
 # ------------------------------------------------------------
 # make build  (default path: Minikube)
@@ -68,11 +94,13 @@ build:
 # kind build/load path (invoked when --kind is passed)
 .PHONY: kind-build
 kind-build:
-	@echo "Building and loading images into kind..."
-	docker build -t python-guestbook-backend:latest ./app/backend
-	docker build -t python-guestbook-frontend:latest ./app/frontend
-	kind load docker-image python-guestbook-backend:latest --name $(KIND_CLUSTER)
-	kind load docker-image python-guestbook-frontend:latest --name $(KIND_CLUSTER)
+	@echo "Building images and pushing to local registry $(REGISTRY)..."
+	@echo "NOTE: Ensure start-local.sh has been run to start the registry and configure kind."
+	# Tag and push to the local registry so the cluster can pull with imagePullPolicy=Always
+	docker build -t $(REGISTRY)/python-guestbook-backend:latest ./app/backend
+	docker build -t $(REGISTRY)/python-guestbook-frontend:latest ./app/frontend
+	docker push $(REGISTRY)/python-guestbook-backend:latest
+	docker push $(REGISTRY)/python-guestbook-frontend:latest
 
 # ------------------------------------------------------------
 # make validate
@@ -135,40 +163,73 @@ apply:
 	  --namespace monitoring \
 	  --wait
 
-	@echo "Starting background port-forwards (silent, daemonized)..."
-	# Clean previous
-	-@start-stop-daemon --stop --pidfile /tmp/pf-frontend.pid >/dev/null 2>&1 || true
-	-@start-stop-daemon --stop --pidfile /tmp/pf-grafana.pid  >/dev/null 2>&1 || true
-	@rm -f /tmp/pf-frontend.pid /tmp/pf-grafana.pid
+	@echo "Ensuring Ingress uses nginx class..."
+	-@kubectl -n app annotate ingress/python-guestbook-frontend kubernetes.io/ingress.class=nginx --overwrite || true
+	-@kubectl -n app patch ingress python-guestbook-frontend --type='json' -p='[{"op":"add","path":"/spec/ingressClassName","value":"nginx"}]' || true
 
-	# Prefer start-stop-daemon if available
-	@if command -v start-stop-daemon >/dev/null 2>&1; then \
-	  start-stop-daemon --start --background --make-pidfile \
-	    --pidfile /tmp/pf-frontend.pid \
-	    --exec /usr/bin/bash -- -c 'while true; do \
-	      kubectl -n app port-forward svc/python-guestbook-frontend 8080:80 --address 127.0.0.1 >/dev/null 2>&1; \
-	      sleep 2; \
-	    done' >/dev/null 2>&1; \
-	  start-stop-daemon --start --background --make-pidfile \
-	    --pidfile /tmp/pf-grafana.pid \
-	    --exec /usr/bin/bash -- -c 'while true; do \
-	      kubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80 --address 127.0.0.1 >/dev/null 2>&1; \
-	      sleep 2; \
-	    done' >/dev/null 2>&1; \
-	else \
-	  ( nohup setsid bash -c 'while true; do \
-	      kubectl -n app port-forward svc/python-guestbook-frontend 8080:80 --address 127.0.0.1 >/dev/null 2>&1 < /dev/null || true; \
-	      sleep 2; \
-	    done' >/dev/null 2>&1 < /dev/null & echo $$! > /tmp/pf-frontend.pid ) >/dev/null 2>&1; \
-	  ( nohup setsid bash -c 'while true; do \
-	      kubectl -n monitoring port-forward svc/$(RELEASE_NAME)-grafana 3000:80 --address 127.0.0.1 >/dev/null 2>&1 < /dev/null || true; \
-	      sleep 2; \
-	    done' >/dev/null 2>&1 < /dev/null & echo $$! > /tmp/pf-grafana.pid ) >/dev/null 2>&1; \
-	fi
+	@echo "Waiting for app rollouts..."
+	-@kubectl -n app rollout status deploy/python-guestbook-backend --timeout=120s || true
+	-@kubectl -n app rollout status deploy/python-guestbook-frontend --timeout=120s || true
 
 	@echo "apply complete."
-	@echo "Frontend:  http://localhost:8080"
-	@echo "Grafana :  http://localhost:3000"
+	@echo "Frontend via ingress: http://localhost/"
+	@echo "Grafana via ingress : http://grafana.localhost/"
+
+# ------------------------------------------------------------
+# kind-apply (uses ingress, registry-based images, no port-forward)
+# ------------------------------------------------------------
+.PHONY: kind-apply
+kind-apply:
+	@echo "Applying app manifests (KIND + Ingress path)..."
+	if [ -d "$(MANIFESTS_DIR)" ]; then \
+	  kubectl apply -f $(MANIFESTS_DIR) -n app; \
+	else \
+	  echo "No $(MANIFESTS_DIR) directory found; skipping app deployment."; \
+	fi
+
+	@echo "Ensuring monitoring secrets (Grafana admin creds)..."
+	if kubectl -n monitoring get secret grafana-admin-credentials >/dev/null 2>&1; then \
+	  echo "grafana-admin-credentials exists; leaving unchanged."; \
+	else \
+	  GRAF_USER="$${GRAFANA_ADMIN_USER:-admin}"; \
+	  GRAF_PASS="$${GRAFANA_ADMIN_PASSWORD:-}"; \
+	  if [[ -z "$${GRAF_PASS:-}" ]]; then \
+	    if command -v openssl >/dev/null 2>&1; then \
+	      GRAF_PASS="$$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)"; \
+	    else \
+	      GRAF_PASS="$$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)"; \
+	    fi; \
+	  fi; \
+	  kubectl -n monitoring create secret generic grafana-admin-credentials \
+	    --from-literal=admin-user="$$GRAF_USER" \
+	    --from-literal=admin-password="$$GRAF_PASS"; \
+	  echo "Created grafana-admin-credentials secret."; \
+	fi
+
+	@echo "Installing/Upgrading kube-prometheus-stack..."
+	helm upgrade --install $(RELEASE_NAME) prometheus-community/kube-prometheus-stack \
+	  --namespace monitoring \
+	  -f $(VALUES_FILE)
+
+	@echo "Installing/Upgrading prometheus-blackbox-exporter..."
+	helm upgrade --install prometheus-blackbox-exporter prometheus-community/prometheus-blackbox-exporter \
+	  --namespace monitoring \
+	  --wait
+
+	@echo "Updating app Deployments to use $(REGISTRY) images..."
+	-@kubectl -n app set image deployment/python-guestbook-backend backend=$(REGISTRY)/python-guestbook-backend:latest || true
+	-@kubectl -n app set image deployment/python-guestbook-frontend frontend=$(REGISTRY)/python-guestbook-frontend:latest || true
+
+	@echo "Ensuring Ingress uses nginx class..."
+	-@kubectl -n app annotate ingress/python-guestbook-frontend kubernetes.io/ingress.class=nginx --overwrite || true
+	-@kubectl -n app patch ingress python-guestbook-frontend --type='json' -p='[{"op":"add","path":"/spec/ingressClassName","value":"nginx"}]' || true
+
+	@echo "Waiting for app rollouts..."
+	-@kubectl -n app rollout status deploy/python-guestbook-backend --timeout=120s || true
+	-@kubectl -n app rollout status deploy/python-guestbook-frontend --timeout=120s || true
+
+	@echo "kind-apply complete."
+	@echo "Frontend via ingress: http://localhost/"
 
 # ------------------------------------------------------------
 # admin helpers
@@ -216,11 +277,11 @@ stop-forward:
 all: init validate
 	@$(MAKE) $(BUILD_STEP)
 	@if [ "$(PROMPT)" = "false" ]; then \
-	  $(MAKE) apply; \
+	  $(MAKE) $(APPLY_STEP); \
 	else \
 	  read -p "Proceed to apply? [y/N]: " ans; \
 	  if [[ "$$ans" =~ ^([yY]|[yY][eE][sS])$$ ]]; then \
-	    $(MAKE) apply; \
+	    $(MAKE) $(APPLY_STEP); \
 	  else \
 	    echo "Aborted."; \
 	  fi; \
