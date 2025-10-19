@@ -58,7 +58,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          make init
+          make init KIND=true
 
       - name: Preinstall kube-prometheus-stack CRDs (dev)
         if: github.ref == 'refs/heads/dev'
