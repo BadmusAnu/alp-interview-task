@@ -9,7 +9,7 @@ on:
 jobs:
   kind-ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -76,6 +76,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          sleep 30 
           make validate
 
       # Main branch: do full apply via make all KIND=true PROMPT=false
