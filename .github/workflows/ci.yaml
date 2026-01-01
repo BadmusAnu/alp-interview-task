@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+
+jobs:
+  kind-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (kubectl, kind, helm)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y make curl ca-certificates gnupg
+
+          # kubectl
+          KUBECTL_VERSION="$(curl -Ls https://dl.k8s.io/release/stable.txt)"
+          curl -L -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
+          # kind
+          KIND_VERSION="v0.23.0"
+          curl -Lo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind --version
+
+          # helm
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          ./get_helm.sh
+          helm version
+
+      - name: Start local kind cluster (with registry + ingress)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x start-local.sh
+          ./start-local.sh
+          # wait for cluster readiness
+          kubectl wait --for=condition=Ready nodes --all --timeout=180s
+          kubectl get nodes -o wide
+
+      # Dev branch: run init, pre-install CRDs, then validate
+      - name: make init (dev)
+        if: github.ref == 'refs/heads/dev'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          make init KIND=true
+
+      - name: Preinstall kube-prometheus-stack CRDs (dev)
+        if: github.ref == 'refs/heads/dev'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Ensure repo exists (init already adds, but keep idempotent here)
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+          helm repo update
+          # Install CRDs required for server-side validation
+          helm show crds prometheus-community/kube-prometheus-stack | kubectl apply --server-side -f -
+
+      - name: Validate manifests and helm (dev)
+        if: github.ref == 'refs/heads/dev'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sleep 30 
+          make validate
+
+      # Main branch: do full apply via make all KIND=true PROMPT=false
+      - name: Build and apply (main)
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          KIND: "true"
+          PROMPT: "false"
+        run: |
+          set -euxo pipefail
+          make all KIND=true PROMPT=false
+
